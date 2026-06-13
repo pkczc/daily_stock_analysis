@@ -34,8 +34,9 @@ except ModuleNotFoundError:
     get_stock_bar = None
 
 from src.config import Config
-from src.storage import DatabaseManager, AnalysisHistory, BacktestResult
+from src.storage import DatabaseManager, AnalysisHistory, BacktestResult, DecisionSignalRecord
 from src.analyzer import AnalysisResult
+from src.daily_market_context_guardrail import apply_daily_market_context_guardrail
 from src.services.history_service import HistoryService
 import src.auth as auth
 
@@ -355,6 +356,48 @@ class AnalysisHistoryTestCase(unittest.TestCase):
         self.assertEqual(item["turnover_rate"], 11.46)
         self.assertEqual(item["market_phase_summary"]["phase"], "intraday")
         self.assertEqual(item["market_phase_summary"]["minutes_to_close"], 300)
+
+    def test_history_persistence_keeps_softened_operation_advice_from_guardrail(self) -> None:
+        """Conservative-market guardrail short operation_advice is persisted and exposed to history list."""
+        result = self._build_result()
+        result.decision_type = "buy"
+        result.operation_advice = "立即买入并积极加仓"
+
+        apply_daily_market_context_guardrail(
+            result,
+            daily_market_context={
+                "region": "cn",
+                "trade_date": "2026-06-06",
+                "summary": "大盘退潮，高风险，建议观望，仓位上限30%。",
+                "risk_tags": ["high_risk", "low_position_cap"],
+            },
+            report_language="zh",
+        )
+
+        saved = self.db.save_analysis_history(
+            result=result,
+            query_id="query_softened_operation_advice",
+            report_type="simple",
+            news_content="新闻摘要",
+            context_snapshot=None,
+            save_snapshot=False,
+        )
+        self.assertEqual(saved, 1)
+
+        service = HistoryService(self.db)
+        payload = service.get_history_list(stock_code="600519", page=1, limit=10)
+
+        self.assertEqual(payload["total"], 1)
+        self.assertEqual(payload["items"][0]["operation_advice"], "观望")
+        self.assertLessEqual(len(payload["items"][0]["operation_advice"]), 20)
+
+        with self.db.get_session() as session:
+            row = session.query(AnalysisHistory).filter(
+                AnalysisHistory.query_id == "query_softened_operation_advice"
+            ).first()
+            if row is None:
+                self.fail("未找到保存的历史记录")
+            self.assertEqual(row.operation_advice, "观望")
 
     def test_market_review_history_can_be_filtered_without_stock_records(self) -> None:
         """Market review records should be queryable as a dedicated history collection."""
@@ -1395,8 +1438,8 @@ class AnalysisHistoryTestCase(unittest.TestCase):
         self.assertIn("✅Safe", markdown)
         self.assertNotIn("🚨Safe", markdown)
 
-    def test_delete_analysis_history_records_also_cleans_backtests(self) -> None:
-        """删除历史记录时应一并清理关联回测结果。"""
+    def test_delete_analysis_history_records_also_cleans_backtests_and_decision_signals(self) -> None:
+        """删除历史记录时应一并清理关联回测结果和决策信号。"""
         record_id = self._save_history("query_delete_001")
 
         with self.db.session_scope() as session:
@@ -1408,6 +1451,36 @@ class AnalysisHistoryTestCase(unittest.TestCase):
                 engine_version="v1",
                 eval_status="pending",
             ))
+            session.add(DecisionSignalRecord(
+                stock_code="600519",
+                stock_name="贵州茅台",
+                market="cn",
+                source_type="analysis",
+                source_report_id=record_id,
+                trace_id="trace-delete-linked",
+                market_phase="intraday",
+                trigger_source="api",
+                action="buy",
+                action_label="买入",
+                reason="linked",
+                plan_quality="minimal",
+                status="active",
+            ))
+            session.add(DecisionSignalRecord(
+                stock_code="000001",
+                stock_name="平安银行",
+                market="cn",
+                source_type="analysis",
+                source_report_id=record_id + 999,
+                trace_id="trace-delete-unrelated",
+                market_phase="intraday",
+                trigger_source="api",
+                action="watch",
+                action_label="观望",
+                reason="unrelated",
+                plan_quality="minimal",
+                status="active",
+            ))
 
         deleted = self.db.delete_analysis_history_records([record_id])
         self.assertEqual(deleted, 1)
@@ -1417,6 +1490,166 @@ class AnalysisHistoryTestCase(unittest.TestCase):
             self.assertEqual(
                 session.query(BacktestResult).filter(BacktestResult.analysis_history_id == record_id).count(),
                 0,
+            )
+            self.assertEqual(
+                session.query(DecisionSignalRecord).filter(DecisionSignalRecord.source_report_id == record_id).count(),
+                0,
+            )
+            self.assertEqual(
+                session.query(DecisionSignalRecord).filter(DecisionSignalRecord.trace_id == "trace-delete-unrelated").count(),
+                1,
+            )
+
+    def test_delete_analysis_history_records_keeps_signals_for_nonexistent_history_id(self) -> None:
+        """不存在的历史 ID 不应触发弱关联 DecisionSignal 清理。"""
+        missing_id = 987654321
+
+        with self.db.session_scope() as session:
+            session.add(DecisionSignalRecord(
+                stock_code="600519",
+                stock_name="贵州茅台",
+                market="cn",
+                source_type="manual",
+                source_report_id=missing_id,
+                trace_id="trace-delete-missing-history",
+                market_phase="intraday",
+                trigger_source="api",
+                action="watch",
+                action_label="观望",
+                reason="manual signal with unverified report id",
+                plan_quality="minimal",
+                status="active",
+            ))
+
+        deleted = self.db.delete_analysis_history_records([missing_id])
+        self.assertEqual(deleted, 0)
+
+        with self.db.get_session() as session:
+            self.assertEqual(
+                session.query(DecisionSignalRecord).filter(
+                    DecisionSignalRecord.trace_id == "trace-delete-missing-history"
+                ).count(),
+                1,
+            )
+
+    def test_delete_analysis_history_records_keeps_manual_signal_with_same_report_id(self) -> None:
+        """source_report_id 是弱引用，真实 history 删除不应误删 manual/pre-report 信号。"""
+        record_id = self._save_history("query_delete_manual_collision")
+
+        with self.db.session_scope() as session:
+            session.add(DecisionSignalRecord(
+                stock_code="600519",
+                stock_name="贵州茅台",
+                market="cn",
+                source_type="analysis",
+                source_report_id=record_id,
+                trace_id="trace-delete-analysis-bound",
+                market_phase="intraday",
+                trigger_source="api",
+                action="buy",
+                action_label="买入",
+                reason="history-bound signal",
+                plan_quality="minimal",
+                status="active",
+            ))
+            session.add(DecisionSignalRecord(
+                stock_code="600519",
+                stock_name="贵州茅台",
+                market="cn",
+                source_type="manual",
+                source_report_id=record_id,
+                trace_id="trace-delete-manual-weak-ref",
+                market_phase="intraday",
+                trigger_source="api",
+                action="watch",
+                action_label="观望",
+                reason="manual signal with caller-supplied report id",
+                plan_quality="minimal",
+                status="active",
+            ))
+
+        deleted = self.db.delete_analysis_history_records([record_id])
+        self.assertEqual(deleted, 1)
+
+        with self.db.get_session() as session:
+            self.assertEqual(
+                session.query(DecisionSignalRecord).filter(
+                    DecisionSignalRecord.trace_id == "trace-delete-analysis-bound"
+                ).count(),
+                0,
+            )
+            self.assertEqual(
+                session.query(DecisionSignalRecord).filter(
+                    DecisionSignalRecord.trace_id == "trace-delete-manual-weak-ref"
+                ).count(),
+                1,
+            )
+
+    def test_delete_analysis_history_records_cleans_only_existing_ids_in_mixed_batch(self) -> None:
+        """混合存在/不存在 ID 时，只清理实际存在历史记录的关联数据。"""
+        record_id = self._save_history("query_delete_mixed")
+        missing_id = record_id + 987654
+
+        with self.db.session_scope() as session:
+            session.add(BacktestResult(
+                analysis_history_id=record_id,
+                code="600519",
+                analysis_date=None,
+                eval_window_days=10,
+                engine_version="v1",
+                eval_status="pending",
+            ))
+            session.add(DecisionSignalRecord(
+                stock_code="600519",
+                stock_name="贵州茅台",
+                market="cn",
+                source_type="analysis",
+                source_report_id=record_id,
+                trace_id="trace-delete-mixed-linked",
+                market_phase="intraday",
+                trigger_source="api",
+                action="buy",
+                action_label="买入",
+                reason="linked",
+                plan_quality="minimal",
+                status="active",
+            ))
+            session.add(DecisionSignalRecord(
+                stock_code="000001",
+                stock_name="平安银行",
+                market="cn",
+                source_type="manual",
+                source_report_id=missing_id,
+                trace_id="trace-delete-mixed-missing",
+                market_phase="intraday",
+                trigger_source="api",
+                action="watch",
+                action_label="观望",
+                reason="weak report id collision",
+                plan_quality="minimal",
+                status="active",
+            ))
+
+        deleted = self.db.delete_analysis_history_records([record_id, missing_id])
+        self.assertEqual(deleted, 1)
+
+        with self.db.get_session() as session:
+            self.assertIsNone(session.query(AnalysisHistory).filter(AnalysisHistory.id == record_id).first())
+            self.assertEqual(
+                session.query(BacktestResult).filter(BacktestResult.analysis_history_id == record_id).count(),
+                0,
+            )
+            self.assertEqual(
+                session.query(DecisionSignalRecord).filter(
+                    DecisionSignalRecord.trace_id == "trace-delete-mixed-linked"
+                ).count(),
+                0,
+            )
+            self.assertEqual(
+                session.query(DecisionSignalRecord).filter(
+                    DecisionSignalRecord.trace_id == "trace-delete-mixed-missing"
+                ).count(),
+                1,
             )
 
     @patch("src.auth.is_auth_enabled", return_value=False)
