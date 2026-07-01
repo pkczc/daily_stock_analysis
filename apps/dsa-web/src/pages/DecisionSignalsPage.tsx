@@ -18,6 +18,7 @@ import {
   DecisionSignalCard,
   DecisionSignalDetails,
 } from '../components/decision-signals/DecisionSignalDisplay';
+import { DecisionSignalTimeline } from '../components/decision-signals/DecisionSignalTimeline';
 import { useUiLanguage } from '../contexts/UiLanguageContext';
 import type { UiTextKey } from '../i18n/uiText';
 import type { DecisionAction, MarketPhaseValue } from '../types/analysis';
@@ -34,8 +35,15 @@ import type {
 } from '../types/decisionSignals';
 import { cn } from '../utils/cn';
 import { buildDecisionActionLabelMap } from '../utils/decisionAction';
+import {
+  getDecisionSignalMarketLabel,
+  getDecisionSignalMarketPhaseLabel,
+  getDecisionSignalSourceTypeLabel,
+} from '../utils/decisionSignalLabels';
 
 const PAGE_SIZE = 20;
+const TIMELINE_PAGE_SIZE = 100;
+const DAY_MS = 86400_000;
 
 type ListFilters = {
   market: '' | DecisionSignalMarket;
@@ -43,7 +51,18 @@ type ListFilters = {
   action: '' | DecisionAction;
   marketPhase: '' | MarketPhaseValue;
   sourceType: '' | DecisionSignalSourceType;
+  sourceReportId: string;
   status: '' | DecisionSignalStatus;
+};
+
+type TimelineRange = '30d' | '90d' | '180d';
+type TimelineStatusFilter = 'all' | 'active';
+
+type TimelineFilters = {
+  market: '' | DecisionSignalMarket;
+  stockCode: string;
+  range: TimelineRange;
+  status: TimelineStatusFilter;
 };
 
 type PendingStatusChange = {
@@ -54,10 +73,10 @@ type PendingStatusChange = {
 
 type SelectedSignal = {
   item: DecisionSignalItem;
-  source: 'list' | 'latest';
+  source: 'list' | 'latest' | 'timeline';
 };
 
-const MARKET_OPTIONS: DecisionSignalMarket[] = ['cn', 'hk', 'us', 'jp', 'kr'];
+const MARKET_OPTIONS: DecisionSignalMarket[] = ['cn', 'hk', 'us', 'jp', 'kr', 'tw'];
 const ACTION_OPTIONS: DecisionAction[] = ['buy', 'add', 'hold', 'reduce', 'sell', 'watch', 'avoid', 'alert'];
 const PHASE_OPTIONS: MarketPhaseValue[] = ['premarket', 'intraday', 'lunch_break', 'closing_auction', 'postmarket', 'non_trading', 'unknown'];
 const SOURCE_OPTIONS: DecisionSignalSourceType[] = ['analysis', 'agent', 'alert', 'market_review', 'manual'];
@@ -85,7 +104,57 @@ const STATUS_ACTION_CONFIRM_KEYS: Record<PendingStatusChange['status'], UiTextKe
   archived: 'decisionSignals.archiveConfirm',
 };
 
+const DEFAULT_LIST_FILTERS: ListFilters = {
+  market: '',
+  stockCode: '',
+  action: '',
+  marketPhase: '',
+  sourceType: '',
+  sourceReportId: '',
+  status: 'active',
+};
+
+const DEFAULT_TIMELINE_FILTERS: TimelineFilters = {
+  market: '',
+  stockCode: '',
+  range: '90d',
+  status: 'all',
+};
+
+const TIMELINE_RANGE_DAYS: Record<TimelineRange, number> = {
+  '30d': 30,
+  '90d': 90,
+  '180d': 180,
+};
+
+function parseSourceReportId(value: string): number | undefined {
+  const trimmed = value.trim();
+  if (!trimmed) return undefined;
+  const parsed = Number(trimmed);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : undefined;
+}
+
+function getInitialFilters(search = typeof window === 'undefined' ? '' : window.location.search): ListFilters {
+  const params = new URLSearchParams(search);
+  const sourceReportId = parseSourceReportId(params.get('sourceReportId') ?? params.get('source_report_id') ?? '');
+  if (sourceReportId === undefined) return DEFAULT_LIST_FILTERS;
+  return {
+    ...DEFAULT_LIST_FILTERS,
+    sourceReportId: String(sourceReportId),
+  };
+}
+
 function toListParams(filters: ListFilters, page: number): DecisionSignalListParams {
+  const sourceReportId = parseSourceReportId(filters.sourceReportId);
+  if (sourceReportId !== undefined) {
+    return {
+      sourceReportId,
+      sourceType: 'analysis',
+      page,
+      pageSize: PAGE_SIZE,
+    };
+  }
+
   return {
     market: filters.market || undefined,
     stockCode: filters.stockCode.trim() || undefined,
@@ -107,6 +176,30 @@ function refreshLatestSelection(
   return refreshed ? { source: 'latest', item: refreshed } : null;
 }
 
+function refreshTimelineSelection(
+  current: SelectedSignal | null,
+  timelineItems: DecisionSignalItem[],
+): SelectedSignal | null {
+  if (!current || current.source !== 'timeline') return current;
+  const refreshed = timelineItems.find((item) => item.id === current.item.id);
+  return refreshed ? { source: 'timeline', item: refreshed } : null;
+}
+
+function toTimelineParams(filters: TimelineFilters): DecisionSignalListParams {
+  const days = TIMELINE_RANGE_DAYS[filters.range];
+  const createdTo = new Date();
+  const createdFrom = new Date(createdTo.getTime() - days * DAY_MS);
+  return {
+    market: filters.market || undefined,
+    stockCode: filters.stockCode.trim(),
+    createdFrom: createdFrom.toISOString(),
+    createdTo: createdTo.toISOString(),
+    status: filters.status === 'active' ? 'active' : undefined,
+    page: 1,
+    pageSize: TIMELINE_PAGE_SIZE,
+  };
+}
+
 function formatStatNumber(value: number | null | undefined): string {
   if (value === null || value === undefined || Number.isNaN(value)) return '-';
   return Number(value).toFixed(2).replace(/\.?0+$/, '');
@@ -120,15 +213,8 @@ function formatStatPercent(value: number | null | undefined): string {
 const DecisionSignalsPage: React.FC = () => {
   const { t } = useUiLanguage();
   const actionLabels = useMemo(() => buildDecisionActionLabelMap(t), [t]);
-  const [filters, setFilters] = useState<ListFilters>({
-    market: '',
-    stockCode: '',
-    action: '',
-    marketPhase: '',
-    sourceType: '',
-    status: 'active',
-  });
-  const [appliedFilters, setAppliedFilters] = useState<ListFilters>(filters);
+  const [filters, setFilters] = useState<ListFilters>(() => getInitialFilters());
+  const [appliedFilters, setAppliedFilters] = useState<ListFilters>(() => getInitialFilters());
   const [page, setPage] = useState(1);
   const [items, setItems] = useState<DecisionSignalItem[]>([]);
   const [total, setTotal] = useState(0);
@@ -145,6 +231,13 @@ const DecisionSignalsPage: React.FC = () => {
   const [latestSearched, setLatestSearched] = useState(false);
   const [latestLoading, setLatestLoading] = useState(false);
   const [latestError, setLatestError] = useState<ParsedApiError | null>(null);
+  const [timelineFilters, setTimelineFilters] = useState<TimelineFilters>(DEFAULT_TIMELINE_FILTERS);
+  const [appliedTimelineFilters, setAppliedTimelineFilters] = useState<TimelineFilters>(DEFAULT_TIMELINE_FILTERS);
+  const [timelineItems, setTimelineItems] = useState<DecisionSignalItem[]>([]);
+  const [timelineSearched, setTimelineSearched] = useState(false);
+  const [timelineLoading, setTimelineLoading] = useState(false);
+  const [timelineError, setTimelineError] = useState<ParsedApiError | null>(null);
+  const [timelineTruncated, setTimelineTruncated] = useState(false);
   const [selectedOutcomes, setSelectedOutcomes] = useState<DecisionSignalOutcomeItem[]>([]);
   const [selectedOutcomesLoading, setSelectedOutcomesLoading] = useState(false);
   const [selectedOutcomesError, setSelectedOutcomesError] = useState<ParsedApiError | null>(null);
@@ -155,6 +248,7 @@ const DecisionSignalsPage: React.FC = () => {
   const requestIdRef = useRef(0);
   const statsRequestIdRef = useRef(0);
   const latestRequestIdRef = useRef(0);
+  const timelineRequestIdRef = useRef(0);
   const detailRequestIdRef = useRef(0);
   const selectedSignalIdRef = useRef<number | null>(null);
   const statusUpdateInFlightRef = useRef(false);
@@ -237,6 +331,10 @@ const DecisionSignalsPage: React.FC = () => {
 
   useEffect(() => () => {
     latestRequestIdRef.current += 1;
+  }, []);
+
+  useEffect(() => () => {
+    timelineRequestIdRef.current += 1;
   }, []);
 
   useEffect(() => {
@@ -327,6 +425,49 @@ const DecisionSignalsPage: React.FC = () => {
     }
   };
 
+  const resetTimelineView = useCallback(() => {
+    timelineRequestIdRef.current += 1;
+    setTimelineItems([]);
+    setTimelineSearched(false);
+    setTimelineLoading(false);
+    setTimelineError(null);
+    setTimelineTruncated(false);
+    setSelected((current) => (current?.source === 'timeline' ? null : current));
+  }, []);
+
+  const handleTimelineSearch = async (event: React.FormEvent) => {
+    event.preventDefault();
+    const stockCode = timelineFilters.stockCode.trim();
+    if (!stockCode) return;
+    const requestId = timelineRequestIdRef.current + 1;
+    timelineRequestIdRef.current = requestId;
+    setTimelineLoading(true);
+    setTimelineError(null);
+    setTimelineSearched(true);
+    const nextAppliedFilters = {
+      ...timelineFilters,
+      stockCode,
+    };
+    try {
+      const response = await decisionSignalsApi.list(toTimelineParams(nextAppliedFilters));
+      if (timelineRequestIdRef.current !== requestId) return;
+      setAppliedTimelineFilters(nextAppliedFilters);
+      setTimelineItems(response.items);
+      setTimelineTruncated(response.total > response.items.length);
+      setSelected((current) => refreshTimelineSelection(current, response.items));
+    } catch (err) {
+      if (timelineRequestIdRef.current !== requestId) return;
+      setTimelineItems([]);
+      setTimelineTruncated(false);
+      setSelected((current) => refreshTimelineSelection(current, []));
+      setTimelineError(getParsedApiError(err));
+    } finally {
+      if (timelineRequestIdRef.current === requestId) {
+        setTimelineLoading(false);
+      }
+    }
+  };
+
   const handleStatusUpdate = async () => {
     if (!pendingStatus || statusUpdateInFlightRef.current) return;
     statusUpdateInFlightRef.current = true;
@@ -340,12 +481,21 @@ const DecisionSignalsPage: React.FC = () => {
         if (item.id !== updated.id) return [item];
         return updated.status === 'active' ? [updated] : [];
       }));
+      setTimelineItems((current) => current.flatMap((item) => {
+        if (item.id !== updated.id) return [item];
+        return appliedTimelineFilters.status === 'active' && updated.status !== 'active' ? [] : [updated];
+      }));
       setSelected((current) => {
         if (!current || current.item.id !== updated.id) return current;
         if (current.source === 'latest') {
           return updated.status === 'active' ? { source: 'latest', item: updated } : null;
         }
-        if (appliedFilters.status && updated.status !== appliedFilters.status) return null;
+        if (current.source === 'timeline') {
+          return appliedTimelineFilters.status === 'active' && updated.status !== 'active'
+            ? null
+            : { source: 'timeline', item: updated };
+        }
+        if (!parseSourceReportId(appliedFilters.sourceReportId) && appliedFilters.status && updated.status !== appliedFilters.status) return null;
         return { source: 'list', item: updated };
       });
       setError(null);
@@ -406,7 +556,7 @@ const DecisionSignalsPage: React.FC = () => {
         />
 
         <Card padding="md">
-          <form className="grid gap-3 md:grid-cols-3 xl:grid-cols-6" onSubmit={handleApplyFilters}>
+          <form className="grid gap-3 md:grid-cols-3 xl:grid-cols-7" onSubmit={handleApplyFilters}>
             <select
               className="input-surface input-focus-glow h-11 rounded-xl border bg-transparent px-3 text-sm"
               value={filters.market}
@@ -415,7 +565,7 @@ const DecisionSignalsPage: React.FC = () => {
             >
               <option value="">{t('decisionSignals.allMarkets')}</option>
               {MARKET_OPTIONS.map((market) => (
-                <option key={market} value={market}>{t(`decisionSignals.market.${market}` as UiTextKey)}</option>
+                <option key={market} value={market}>{getDecisionSignalMarketLabel(market, t)}</option>
               ))}
             </select>
             <input
@@ -443,7 +593,9 @@ const DecisionSignalsPage: React.FC = () => {
               aria-label={t('decisionSignals.marketPhase')}
             >
               <option value="">{t('decisionSignals.allPhases')}</option>
-              {PHASE_OPTIONS.map((phase) => <option key={phase} value={phase}>{phase}</option>)}
+              {PHASE_OPTIONS.map((phase) => (
+                <option key={phase} value={phase}>{getDecisionSignalMarketPhaseLabel(phase, t)}</option>
+              ))}
             </select>
             <select
               className="input-surface input-focus-glow h-11 rounded-xl border bg-transparent px-3 text-sm"
@@ -452,8 +604,21 @@ const DecisionSignalsPage: React.FC = () => {
               aria-label={t('decisionSignals.source')}
             >
               <option value="">{t('decisionSignals.allSources')}</option>
-              {SOURCE_OPTIONS.map((source) => <option key={source} value={source}>{source}</option>)}
+              {SOURCE_OPTIONS.map((source) => (
+                <option key={source} value={source}>{getDecisionSignalSourceTypeLabel(source, t)}</option>
+              ))}
             </select>
+            <input
+              className="input-surface input-focus-glow h-11 rounded-xl border bg-transparent px-3 text-sm"
+              value={filters.sourceReportId}
+              onChange={(event) => setFilters((current) => ({ ...current, sourceReportId: event.target.value }))}
+              placeholder={t('decisionSignals.sourceReportId')}
+              aria-label={t('decisionSignals.sourceReportId')}
+              inputMode="numeric"
+              min={1}
+              step={1}
+              type="number"
+            />
             <select
               className="input-surface input-focus-glow h-11 rounded-xl border bg-transparent px-3 text-sm"
               value={filters.status}
@@ -463,7 +628,7 @@ const DecisionSignalsPage: React.FC = () => {
               <option value="">{t('decisionSignals.allStatuses')}</option>
               {STATUS_OPTIONS.map((status) => <option key={status} value={status}>{t(STATUS_LABEL_KEYS[status])}</option>)}
             </select>
-            <button type="submit" className="btn-primary inline-flex h-11 items-center justify-center gap-2 xl:col-start-6">
+            <button type="submit" className="btn-primary inline-flex h-11 items-center justify-center gap-2">
               <Search className="h-4 w-4" />
               {t('decisionSignals.filter')}
             </button>
@@ -547,6 +712,81 @@ const DecisionSignalsPage: React.FC = () => {
               ))}
             </div>
           ) : null}
+        </Card>
+
+        <Card title={t('decisionSignals.timelineTitle')} subtitle={t('decisionSignals.timelineDescription')} padding="md">
+          <form className="grid gap-3 md:grid-cols-5" onSubmit={handleTimelineSearch}>
+            <select
+              className="input-surface input-focus-glow h-11 rounded-xl border bg-transparent px-3 text-sm"
+              value={timelineFilters.market}
+              onChange={(event) => setTimelineFilters((current) => ({ ...current, market: event.target.value as TimelineFilters['market'] }))}
+              aria-label={t('decisionSignals.timelineMarket')}
+            >
+              <option value="">{t('decisionSignals.allMarkets')}</option>
+              {MARKET_OPTIONS.map((market) => (
+                <option key={market} value={market}>{getDecisionSignalMarketLabel(market, t)}</option>
+              ))}
+            </select>
+            <input
+              className="input-surface input-focus-glow h-11 rounded-xl border bg-transparent px-3 text-sm md:col-span-2"
+              value={timelineFilters.stockCode}
+              onChange={(event) => {
+                const stockCode = event.target.value;
+                setTimelineFilters((current) => ({ ...current, stockCode }));
+                if (!stockCode.trim()) {
+                  resetTimelineView();
+                }
+              }}
+              placeholder={t('decisionSignals.timelineStockPlaceholder')}
+              aria-label={t('decisionSignals.timelineStockCode')}
+            />
+            <select
+              className="input-surface input-focus-glow h-11 rounded-xl border bg-transparent px-3 text-sm"
+              value={timelineFilters.range}
+              onChange={(event) => setTimelineFilters((current) => ({ ...current, range: event.target.value as TimelineRange }))}
+              aria-label={t('decisionSignals.timelineRange')}
+            >
+              <option value="30d">{t('decisionSignals.timelineRange.30d')}</option>
+              <option value="90d">{t('decisionSignals.timelineRange.90d')}</option>
+              <option value="180d">{t('decisionSignals.timelineRange.180d')}</option>
+            </select>
+            <select
+              className="input-surface input-focus-glow h-11 rounded-xl border bg-transparent px-3 text-sm"
+              value={timelineFilters.status}
+              onChange={(event) => setTimelineFilters((current) => ({ ...current, status: event.target.value as TimelineStatusFilter }))}
+              aria-label={t('decisionSignals.timelineStatus')}
+            >
+              <option value="all">{t('decisionSignals.timelineStatus.all')}</option>
+              <option value="active">{t('decisionSignals.timelineStatus.active')}</option>
+            </select>
+            <button
+              type="submit"
+              className="btn-secondary inline-flex h-11 items-center justify-center gap-2 md:col-start-5"
+              disabled={timelineLoading || !timelineFilters.stockCode.trim()}
+            >
+              <Search className="h-4 w-4" />
+              {t('decisionSignals.timelineSearch')}
+            </button>
+          </form>
+          <div className="mt-4">
+            {!timelineSearched ? (
+              <EmptyState
+                className="border-none bg-transparent py-6 shadow-none"
+                title={t('decisionSignals.timelineGuideTitle')}
+                description={t('decisionSignals.timelineGuideDescription')}
+                icon={<Activity className="h-6 w-6" />}
+              />
+            ) : (
+              <DecisionSignalTimeline
+                items={timelineItems}
+                selectedId={selected?.item.id ?? null}
+                loading={timelineLoading}
+                error={timelineError?.message ?? null}
+                truncated={timelineTruncated}
+                onSelect={(selectedItem) => setSelected({ source: 'timeline', item: selectedItem })}
+              />
+            )}
+          </div>
         </Card>
 
         {error ? (
